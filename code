@@ -1,0 +1,22 @@
+const movies = [
+  { title: "Inception", genres: ["sci-fi", "thriller"] },
+  { title: "Interstellar", genres: ["sci-fi", "drama"] },
+  { title: "The Dark Knight", genres: ["action", "crime"] },
+  { title: "Joker", genres: ["drama", "crime"] },
+  { title: "Avengers", genres: ["action", "sci-fi"] }
+];
+
+// basic similarity: count matching genres
+function recommend(movieTitle) {
+  const base = movies.find(m => m.title === movieTitle);
+
+  return movies
+    .filter(m => m.title !== movieTitle)
+    .map(m => {
+      const score = m.genres.filter(g => base.genres.includes(g)).length;
+      return { title: m.title, score };
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
+console.log(recommend("Inception"));
