@@ -1,0 +1,188 @@
+"""Production orchestration: guardrails → memory → tools → model → output safety → logs."""
+
+from __future__ import annotations
+
+import time
+import os
+from dataclasses import dataclass, field
+
+from assistant import OSSAssistant, Turn, resolve_model_id
+from guardrails import check_input, check_output, refusal_message
+from memory import ConversationMemory
+from observability import RuntimeLogger
+from tools import ToolResult, format_tool_context, run_tools
+
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful, honest assistant. Give concise answers. "
+    "Avoid stereotypes and harmful generalizations. "
+    "Refuse requests for illegal, dangerous, or unethical content. "
+    "When tool results are provided, use them in your answer."
+)
+
+
+@dataclass
+class PipelineResponse:
+    text: str
+    latency_sec: float
+    refused: bool = False
+    refusal_reason: str = ""
+    tools_used: list[str] = field(default_factory=list)
+    tool_results: list[ToolResult] = field(default_factory=list)
+    safety_events: list[dict[str, str]] = field(default_factory=list)
+    model_id: str = ""
+
+
+class AssistantPipeline:
+    """End-to-end request handler for CLI, Streamlit, and HF Spaces."""
+
+    def __init__(
+        self,
+        assistant: OSSAssistant | None = None,
+        memory: ConversationMemory | None = None,
+        logger: RuntimeLogger | None = None,
+        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        enable_tools: bool = True,
+        enable_guardrails: bool = True,
+    ) -> None:
+        self.assistant = assistant or OSSAssistant(model_id=resolve_model_id())
+        self.memory = memory or ConversationMemory(max_turns=8)
+        self.logger = logger or RuntimeLogger()
+        self.system_prompt = system_prompt
+        self.enable_tools = enable_tools
+        self.enable_guardrails = enable_guardrails
+
+    def reset(self) -> None:
+        self.memory.reset()
+        self.assistant.reset()
+
+    def _sync_memory_to_assistant(self) -> None:
+        self.assistant.reset()
+        for msg in self.memory.get_messages():
+            if msg["role"] in {"user", "assistant"}:
+                self.assistant.history.append(Turn(msg["role"], msg["content"]))
+
+    def handle(self, user_message: str) -> PipelineResponse:
+        start = time.perf_counter()
+        safety_events: list[dict[str, str]] = []
+        tools_used: list[str] = []
+        tool_results: list[ToolResult] = []
+
+        if self.enable_guardrails:
+            input_check = check_input(user_message)
+            if not input_check.safe:
+                safety_events.append(
+                    {
+                        "layer": input_check.layer,
+                        "category": input_check.category,
+                        "reason": input_check.reason,
+                    }
+                )
+                refusal = refusal_message(input_check)
+                latency = time.perf_counter() - start
+                self.logger.log(
+                    user_message,
+                    refusal,
+                    latency,
+                    tools_used=[],
+                    safety_events=safety_events,
+                    jailbreak_detected=input_check.category == "jailbreak",
+                    refused=True,
+                    model_id=self.assistant.model_id,
+                )
+                return PipelineResponse(
+                    text=refusal,
+                    latency_sec=latency,
+                    refused=True,
+                    refusal_reason=input_check.reason,
+                    safety_events=safety_events,
+                    model_id=self.assistant.model_id,
+                )
+
+        augmented_message = user_message
+        if self.enable_tools:
+            # Execute tools and collect results
+            tool_results = run_tools(user_message)
+            tools_used = [r.tool for r in tool_results if r.success]
+            # Format tool results for injection into model context
+            tool_context = format_tool_context(tool_results)
+
+            # Debug logging for development visibility
+            if os.environ.get("ASSISTANT_DEBUG") == "1":
+                print("Detected tools:", tools_used)
+                print("Tool results:", [dict(tool=r.tool, success=r.success, output=(r.output[:200] + '...') if r.output else '') for r in tool_results])
+
+            # Inject tool results into the prompt so the model can use them
+            if tool_context:
+                augmented_message = (
+                    f"User request:\n{user_message}\n\nTool results:\n{tool_context}\n\n"
+                    "Use the tool results when answering the user's request."
+                )
+            else:
+                augmented_message = user_message
+
+        self._sync_memory_to_assistant()
+        model_response = self.assistant.chat(augmented_message, system_prompt=self.system_prompt)
+        reply = model_response.text
+
+        # Ensure tool outputs are visible. If web_search was used, force a visible block
+        if tool_results and tools_used:
+            tool_block = "\n\n".join(f"**[{r.tool}]** {r.output}" for r in tool_results if r.success)
+
+            # If web_search used, prepend a clear indicator so users see retrieval
+            if "web_search" in tools_used and tool_block:
+                prefix = "I searched the web and found:\n\n" + tool_block + "\n\n"
+                # Avoid duplicating if model already mentioned results
+                if not reply.strip().lower().startswith("i searched the web"):
+                    reply = prefix + reply
+            else:
+                # For non-web tools, if the model didn't incorporate tool names, append them
+                try:
+                    lower_reply = reply.lower()
+                except Exception:
+                    lower_reply = ""
+                if tool_block and not any(r.tool.replace("_", " ") in lower_reply for r in tool_results):
+                    reply = f"{reply}\n\n---\n{tool_block}"
+
+        if self.enable_guardrails:
+            output_check = check_output(reply)
+            if not output_check.safe:
+                safety_events.append(
+                    {
+                        "layer": output_check.layer,
+                        "category": output_check.category,
+                        "reason": output_check.reason,
+                    }
+                )
+                reply = refusal_message(output_check)
+
+        self.memory.add_exchange(user_message, reply)
+        latency = time.perf_counter() - start
+
+        # Include raw tool outputs in logger metadata for debugging/observability
+        try:
+            tool_outputs_meta = {r.tool: r.output for r in tool_results}
+        except Exception:
+            tool_outputs_meta = {}
+
+        self.logger.log(
+            user_message,
+            reply,
+            latency,
+            tools_used=tools_used,
+            safety_events=safety_events,
+            jailbreak_detected=any(e.get("category") == "jailbreak" for e in safety_events),
+            refused=any(e.get("category") in {"jailbreak", "harmful", "injection"} for e in safety_events)
+            or reply.startswith("I can't"),
+            model_id=self.assistant.model_id,
+            metadata={"model_latency_sec": model_response.latency_sec, "tool_outputs": tool_outputs_meta},
+        )
+
+        return PipelineResponse(
+            text=reply,
+            latency_sec=latency,
+            tools_used=tools_used,
+            tool_results=tool_results,
+            safety_events=safety_events,
+            model_id=self.assistant.model_id,
+        )
