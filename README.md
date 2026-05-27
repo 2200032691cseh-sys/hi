@@ -1,5 +1,5 @@
 bye
 e
 e r r 
-d
+dg
 g
